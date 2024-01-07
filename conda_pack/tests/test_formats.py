@@ -119,6 +119,13 @@ def check(out_dir, root=None, links=False):
         assert files == {'one', 'two'}
 
 
+def check_added_files(out_dir):
+    for dir in ["dir", "somedir/nested dir"]:
+        assert isfile(join(out_dir, dir, "from_bytes"))
+        with open(join(out_dir, dir, "from_bytes"), 'rb') as fil:
+            assert fil.read() == b"foo bar"
+
+
 def has_infozip_cli():
     try:
         out = check_output(['unzip', '-h'], stderr=STDOUT).decode()
@@ -135,78 +142,102 @@ def has_tar_cli():
         return False
 
 
-@pytest.mark.parametrize('format, zip_symlinks', [
-    ('zip', True), ('zip', False),
-    ('tar.gz', False), ('tar.bz2', False), ('tar.xz', False), ('tar', False),
-    ('squashfs', False)
-])
-def test_format(tmpdir, format, zip_symlinks, root_and_paths):
-    if format == 'zip':
-        if zip_symlinks and (on_win or not has_infozip_cli()):
-            pytest.skip("Cannot test zipfile symlink support on this platform")
-        test_symlinks = zip_symlinks
-    else:
-        test_symlinks = not on_win
-    if format == "squashfs":
-        if on_win:
-            # mksquashfs can work on win, but we don't support moving envs
-            # between OSs anyway, so we don't test it either
-            pytest.skip("Cannot mount squashfs on windows")
-        elif on_mac and sys.version_info < (3, 9):
-            # We have some spurious hardlinking issues with older Pythons.
-            # xfail them until we can remove support for them.
-            pytest.xfail("Sometimes hardlinking inside the test environment fails.")
-
+@pytest.mark.parametrize('format', ['tar.gz', 'tar.bz2', 'tar.xz', 'tar'])
+def test_format(tmpdir, format, root_and_paths):
+    test_symlinks = not on_win
     root, paths = root_and_paths
+    packed_env_path, spill_dir = packed_env_path_and_spill_dir(format, tmpdir)
 
-    packed_env_path = join(str(tmpdir), 'test.' + format)
-    spill_dir = join(str(tmpdir), 'test')
-    os.mkdir(spill_dir)
+    with open(packed_env_path, mode='wb') as fil:
+        with archive(fil, packed_env_path, '', format) as arc:
+            add_files_to_archive(arc, paths, root)
+
+    with tarfile.open(packed_env_path) as out:
+        out.extractall(spill_dir)
+
+    check(spill_dir, links=test_symlinks, root=root)
+    check_added_files(spill_dir)
+
+
+@pytest.mark.parametrize('zip_symlinks', [True, False])
+def test_format_zip(tmpdir, zip_symlinks, root_and_paths):
+    format = 'zip'
+    if zip_symlinks and (on_win or not has_infozip_cli()):
+        pytest.skip("Cannot test zipfile symlink support on this platform")
+    test_symlinks = zip_symlinks
+    root, paths = root_and_paths
+    packed_env_path, spill_dir = packed_env_path_and_spill_dir(format, tmpdir)
 
     with open(packed_env_path, mode='wb') as fil:
         with archive(fil, packed_env_path, '', format, zip_symlinks=zip_symlinks) as arc:
-            for rel in paths:
-                arc.add(join(root, rel), rel)
-            arc.add_bytes(join(root, "file"),
-                          b"foo bar",
-                          join("dir", "from_bytes"))
-            arc.add_bytes(join(root, "file"),
-                          b"foo bar",
-                          join("somedir/nested dir", "from_bytes"))
-            if format == "squashfs":
-                arc.mksquashfs_from_staging()
+            add_files_to_archive(arc, paths, root)
 
-    if format == 'zip':
-        if test_symlinks:
-            check_output(['unzip', packed_env_path, '-d', spill_dir])
-        else:
-            with zipfile.ZipFile(packed_env_path) as out:
-                out.extractall(spill_dir)
-    elif format == "squashfs":
-        if on_mac:
-            # There is no simple way to install MacFUSE + squashfuse on the macOS CI runners.
-            # So instead of mounting we extract the archive and check the contents that way.
-
-            # unsquashfs creates its own directories
-            os.rmdir(spill_dir)
-            cmd = ["unsquashfs", "-dest", spill_dir, packed_env_path]
-            subprocess.check_output(cmd)
-        else:
-            cmd = ["squashfuse", packed_env_path, spill_dir]
-            subprocess.check_output(cmd)
+    if test_symlinks:
+        check_output(['unzip', packed_env_path, '-d', spill_dir])
     else:
-        with tarfile.open(packed_env_path) as out:
+        with zipfile.ZipFile(packed_env_path) as out:
             out.extractall(spill_dir)
 
     check(spill_dir, links=test_symlinks, root=root)
-    for dir in ["dir", "somedir/nested dir"]:
-        assert isfile(join(spill_dir, dir, "from_bytes"))
-        with open(join(spill_dir, dir, "from_bytes"), 'rb') as fil:
-            assert fil.read() == b"foo bar"
+    check_added_files(spill_dir)
 
-    if format == "squashfs" and on_linux:
+
+def test_format_squashfs(tmpdir, root_and_paths):
+    format = "squashfs"
+    test_symlinks = not on_win
+    if on_win:
+        # mksquashfs can work on win, but we don't support moving envs
+        # between OSs anyway, so we don't test it either
+        pytest.skip("Cannot mount squashfs on windows")
+    elif on_mac and sys.version_info < (3, 9):
+        # We have some spurious hardlinking issues with older Pythons.
+        # xfail them until we can remove support for them.
+        pytest.xfail("Sometimes hardlinking inside the test environment fails.")
+
+    root, paths = root_and_paths
+    packed_env_path, spill_dir = packed_env_path_and_spill_dir(format, tmpdir)
+
+    with open(packed_env_path, mode='wb') as fil:
+        with archive(fil, packed_env_path, '', format) as arc:
+            add_files_to_archive(arc, paths, root)
+            arc.mksquashfs_from_staging()
+
+    if on_mac:
+        # There is no simple way to install MacFUSE + squashfuse on the macOS CI runners.
+        # So instead of mounting we extract the archive and check the contents that way.
+
+        # unsquashfs creates its own directories
+        os.rmdir(spill_dir)
+        cmd = ["unsquashfs", "-dest", spill_dir, packed_env_path]
+        subprocess.check_output(cmd)
+    else:
+        cmd = ["squashfuse", packed_env_path, spill_dir]
+        subprocess.check_output(cmd)
+
+    check(spill_dir, links=test_symlinks, root=root)
+    check_added_files(spill_dir)
+
+    if on_linux:
         cmd = ["fusermount", "-u", spill_dir]
         subprocess.check_output(cmd)
+
+
+def packed_env_path_and_spill_dir(format, tmpdir):
+    packed_env_path = join(str(tmpdir), 'test.' + format)
+    spill_dir = join(str(tmpdir), 'test')
+    os.mkdir(spill_dir)
+    return packed_env_path, spill_dir
+
+
+def add_files_to_archive(arc, paths, root):
+    for rel in paths:
+        arc.add(join(root, rel), rel)
+    arc.add_bytes(join(root, "file"),
+                  b"foo bar",
+                  join("dir", "from_bytes"))
+    arc.add_bytes(join(root, "file"),
+                  b"foo bar",
+                  join("somedir/nested dir", "from_bytes"))
 
 
 def test_n_threads():
